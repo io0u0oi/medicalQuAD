@@ -9,6 +9,8 @@ COPY ["Pipfile", "Pipfile.lock", "./"]
 
 RUN pipenv install --deploy --ignore-pipfile --system
 
+COPY medcpt_retrieval.py .
+COPY vector_db vector_db
 COPY medical_question_answering_assistant .
 
 EXPOSE 5000

@@ -1,28 +1,34 @@
 import json
-
+import os
+import sys
+from pathlib import Path
 from time import time
 
-from openai import OpenAI
+from dotenv import load_dotenv
+from google import genai
 
-import ingest
+# 優先載入 .env 環境變數，確保後續讀取 GEMINI_API_KEY 與 GEMINI_MODEL 時已就緒
+load_dotenv()
+
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+for p in (str(CURRENT_DIR), str(PROJECT_ROOT)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from medcpt_retrieval import MedCPTRetriever
+
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+# 初始化 Gemini Client（設定 30 秒請求逾時，避免網路或伺服器延遲導致程式無限期卡死）
+client = genai.Client(http_options={"timeout": 30000})
+
+# 初始化 MedCPT + FAISS 檢索器
+retriever = MedCPTRetriever()
 
 
-client = OpenAI()
-index = ingest.load_index()
-
-
-def search(query):
-    boost = {
-        'question': 0.3417604466420481,
-        'answer': 1.8419912735713542,
-        'source': 0.25631365201530965,
-        'focus_area': 0.22228140744464786
-    }
-
-    results = index.search(
-        query=query, filter_dict={}, boost_dict=boost, num_results=10
-    )
-
+def search(query, top_k=5):
+    results = retriever.search(query=query, top_k=top_k)
     return results
 
 
@@ -55,17 +61,27 @@ def build_prompt(query, search_results):
     return prompt
 
 
-def llm(prompt, model="gpt-4o-mini"):
-    response = client.chat.completions.create(
-        model=model, messages=[{"role": "user", "content": prompt}]
+def llm(prompt, model=DEFAULT_GEMINI_MODEL):
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
     )
 
-    answer = response.choices[0].message.content
+    answer = response.text or ""
+
+    usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = (getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
+    completion_tokens = (getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
+    total_tokens = (
+        (getattr(usage, "total_token_count", 0) or (prompt_tokens + completion_tokens))
+        if usage
+        else 0
+    )
 
     token_stats = {
-        "prompt_tokens": response.usage.prompt_tokens,
-        "completion_tokens": response.usage.completion_tokens,
-        "total_tokens": response.usage.total_tokens,
+        "prompt_tokens": int(prompt_tokens),
+        "completion_tokens": int(completion_tokens),
+        "total_tokens": int(total_tokens),
     }
 
     return answer, token_stats
@@ -92,47 +108,46 @@ and provide your evaluation in parsable JSON without using code blocks:
 """.strip()
 
 
-def evaluate_relevance(question, answer):
+def evaluate_relevance(question, answer, model=DEFAULT_GEMINI_MODEL):
     prompt = evaluation_prompt_template.format(question=question, answer=answer)
-    evaluation, tokens = llm(prompt, model="gpt-4o-mini")
+    evaluation, tokens = llm(prompt, model=model)
+
+    # 防呆清理：若模型仍回傳 ```json ... ``` 區塊，先去除外框再解析 JSON
+    cleaned_eval = evaluation.strip()
+    if cleaned_eval.startswith("```"):
+        lines = cleaned_eval.splitlines()
+        if len(lines) >= 3:
+            cleaned_eval = "\n".join(lines[1:-1]).strip()
 
     try:
-        json_eval = json.loads(evaluation)
+        json_eval = json.loads(cleaned_eval)
         return json_eval, tokens
     except json.JSONDecodeError:
         result = {"Relevance": "UNKNOWN", "Explanation": "Failed to parse evaluation"}
         return result, tokens
 
 
-def calculate_openai_cost(model, tokens):
-    openai_cost = 0
-
-    if model == "gpt-4o-mini":
-        openai_cost = (
-            tokens["prompt_tokens"] * 0.00015 + tokens["completion_tokens"] * 0.0006
-        ) / 1000
-    else:
-        print("Model not recognized. OpenAI cost calculation failed.")
-
-    return openai_cost
+def calculate_gemini_cost(model, tokens):
+    # 依專案規範，不假設或硬編碼 Gemini API 計費單價，預設回傳 0.0
+    return 0.0
 
 
-def rag(query, model="gpt-4o-mini"):
+def rag(query, model=DEFAULT_GEMINI_MODEL):
     t0 = time()
 
     search_results = search(query)
     prompt = build_prompt(query, search_results)
     answer, token_stats = llm(prompt, model=model)
 
-    relevance, rel_token_stats = evaluate_relevance(query, answer)
+    relevance, rel_token_stats = evaluate_relevance(query, answer, model=model)
 
     t1 = time()
     took = t1 - t0
 
-    openai_cost_rag = calculate_openai_cost(model, token_stats)
-    openai_cost_eval = calculate_openai_cost(model, rel_token_stats)
+    gemini_cost_rag = calculate_gemini_cost(model, token_stats)
+    gemini_cost_eval = calculate_gemini_cost(model, rel_token_stats)
 
-    openai_cost = openai_cost_rag + openai_cost_eval
+    gemini_cost = gemini_cost_rag + gemini_cost_eval
 
     answer_data = {
         "answer": answer,
@@ -148,7 +163,7 @@ def rag(query, model="gpt-4o-mini"):
         "eval_prompt_tokens": rel_token_stats["prompt_tokens"],
         "eval_completion_tokens": rel_token_stats["completion_tokens"],
         "eval_total_tokens": rel_token_stats["total_tokens"],
-        "openai_cost": openai_cost,
+        "gemini_cost": gemini_cost,
     }
 
     return answer_data

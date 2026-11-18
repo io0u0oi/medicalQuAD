@@ -3,6 +3,9 @@ import psycopg2
 from psycopg2.extras import DictCursor
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
+
+load_dotenv()
 
 RUN_TIMEZONE_CHECK = os.getenv('RUN_TIMEZONE_CHECK', '1') == '1'
 
@@ -12,7 +15,7 @@ tz = ZoneInfo(TZ_INFO)
 
 def get_db_connection():
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "postgres"),
+        host=os.getenv("POSTGRES_HOST", "localhost"),
         database=os.getenv("POSTGRES_DB", "course_assistant"),
         user=os.getenv("POSTGRES_USER", "your_username"),
         password=os.getenv("POSTGRES_PASSWORD", "your_password"),
@@ -23,11 +26,9 @@ def init_db():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS feedback")
-            cur.execute("DROP TABLE IF EXISTS conversations")
-
+            # 1. 若資料表不存在則建立（不再執行 DROP TABLE，完整保留舊資料）
             cur.execute("""
-                CREATE TABLE conversations (
+                CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     question TEXT NOT NULL,
                     answer TEXT NOT NULL,
@@ -41,19 +42,42 @@ def init_db():
                     eval_prompt_tokens INTEGER NOT NULL,
                     eval_completion_tokens INTEGER NOT NULL,
                     eval_total_tokens INTEGER NOT NULL,
-                    openai_cost FLOAT NOT NULL,
+                    gemini_cost FLOAT NOT NULL,
                     timestamp TIMESTAMP WITH TIME ZONE NOT NULL
                 )
             """)
             cur.execute("""
-                CREATE TABLE feedback (
+                CREATE TABLE IF NOT EXISTS feedback (
                     id SERIAL PRIMARY KEY,
                     conversation_id TEXT REFERENCES conversations(id),
                     feedback INTEGER NOT NULL,
                     timestamp TIMESTAMP WITH TIME ZONE NOT NULL
                 )
             """)
+
+            # 2. 安全遷移舊資料表欄位：檢查 conversations 现有的欄位名稱
+            cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'conversations';
+            """)
+            columns = {row[0] for row in cur.fetchall()}
+
+            if "openai_cost" in columns and "gemini_cost" not in columns:
+                cur.execute("""
+                    ALTER TABLE conversations
+                    RENAME COLUMN openai_cost TO gemini_cost;
+                """)
+                print("資料庫遷移成功：已將 conversations.openai_cost 重新命名為 gemini_cost。")
+            elif "gemini_cost" in columns:
+                print("資料庫欄位檢查完成：gemini_cost 已存在，無需重複遷移。")
+
         conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"初始化或遷移資料庫時發生錯誤: {e}")
+        raise
     finally:
         conn.close()
 
@@ -67,10 +91,10 @@ def save_conversation(conversation_id, question, answer_data, timestamp=None):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO conversations 
-                (id, question, answer, model_used, response_time, relevance, 
-                relevance_explanation, prompt_tokens, completion_tokens, total_tokens, 
-                eval_prompt_tokens, eval_completion_tokens, eval_total_tokens, openai_cost, timestamp)
+                INSERT INTO conversations
+                (id, question, answer, model_used, response_time, relevance,
+                relevance_explanation, prompt_tokens, completion_tokens, total_tokens,
+                eval_prompt_tokens, eval_completion_tokens, eval_total_tokens, gemini_cost, timestamp)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
@@ -87,7 +111,7 @@ def save_conversation(conversation_id, question, answer_data, timestamp=None):
                     answer_data["eval_prompt_tokens"],
                     answer_data["eval_completion_tokens"],
                     answer_data["eval_total_tokens"],
-                    answer_data["openai_cost"],
+                    answer_data["gemini_cost"],
                     timestamp
                 ),
             )
@@ -136,7 +160,7 @@ def get_feedback_stats():
     try:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     SUM(CASE WHEN feedback > 0 THEN 1 ELSE 0 END) as thumbs_up,
                     SUM(CASE WHEN feedback < 0 THEN 1 ELSE 0 END) as thumbs_down
                 FROM feedback
@@ -166,14 +190,14 @@ def check_timezone():
 
             # Use py_time instead of tz for insertion
             cur.execute("""
-                INSERT INTO conversations 
-                (id, question, answer, model_used, response_time, relevance, 
-                relevance_explanation, prompt_tokens, completion_tokens, total_tokens, 
-                eval_prompt_tokens, eval_completion_tokens, eval_total_tokens, openai_cost, timestamp)
+                INSERT INTO conversations
+                (id, question, answer, model_used, response_time, relevance,
+                relevance_explanation, prompt_tokens, completion_tokens, total_tokens,
+                eval_prompt_tokens, eval_completion_tokens, eval_total_tokens, gemini_cost, timestamp)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING timestamp;
-            """, 
-            ('test', 'test question', 'test answer', 'test model', 0.0, 0.0, 
+            """,
+            ('test', 'test question', 'test answer', 'test model', 0.0, 'test relevance',
              'test explanation', 0, 0, 0, 0, 0, 0, 0.0, py_time))
 
             inserted_time = cur.fetchone()[0]
